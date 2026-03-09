@@ -1,5 +1,15 @@
 {
   "hf_vl_models": {
+    "Qwen3.5-0.8B": {
+      "repo_id": "Qwen/Qwen3.5-0.8B",
+      "default": false,
+      "quantized": false,
+      "vram_requirement": {
+        "full": 2.5,
+        "8bit": 1.5,
+        "4bit": 1.0
+      }
+    },
     "Qwen3-VL-2B-Instruct": {
       "repo_id": "Qwen/Qwen3-VL-2B-Instruct",
       "default": true,

@@ -760,6 +760,13 @@ class QwenVLBase:
         array = (tensor.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
         return Image.fromarray(array)
 
+    def _is_qwen35_model(self):
+        """Check if current model is Qwen3.5 architecture."""
+        if self.model is None:
+            return False
+        model_type = getattr(self.model.config, "model_type", "")
+        return model_type == "qwen3_5"
+
     @torch.no_grad()
     def generate(
         self,
@@ -774,6 +781,14 @@ class QwenVLBase:
         num_beams,
         repetition_penalty,
     ):
+        # Check if this is Qwen3.5 model (different architecture)
+        if self._is_qwen35_model():
+            return self._generate_qwen35(
+                prompt_text, image, video, frame_count, video_fps,
+                max_tokens, temperature, top_p, num_beams, repetition_penalty
+            )
+        
+        # Original Qwen3-VL / Qwen2.5-VL generation
         conversation = [{"role": "user", "content": []}]
         if image is not None:
             conversation[0]["content"].append({"type": "image", "image": self.tensor_to_pil(image)})
@@ -831,6 +846,141 @@ class QwenVLBase:
         outputs = self.model.generate(**model_inputs, **kwargs)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        input_len = model_inputs["input_ids"].shape[-1]
+        text = self.tokenizer.decode(outputs[0, input_len:], skip_special_tokens=True)
+        return text.strip()
+
+    @torch.no_grad()
+    def _generate_qwen35(
+        self,
+        prompt_text,
+        image,
+        video,
+        frame_count,
+        video_fps,
+        max_tokens,
+        temperature,
+        top_p,
+        num_beams,
+        repetition_penalty,
+    ):
+        """Generate text using Qwen3.5 model with its native multimodal format.
+        
+        Note: Qwen3.5's video processor has issues, so we treat video frames as
+        multiple images for reliable processing.
+        """
+        # Build content list for Qwen3.5 format
+        content = []
+        images_list = []
+        
+        # Process image input
+        if image is not None:
+            pil_image = self.tensor_to_pil(image)
+            content.append({"type": "image"})
+            images_list.append(pil_image)
+        
+        # Process video input as multiple images (Qwen3.5 video processor has issues)
+        # All provided frames are processed - user controls frame selection externally
+        if video is not None:
+            frames = [self.tensor_to_pil(frame) for frame in video]
+            
+            if frames:
+                num_frames = len(frames)
+                
+                # Warning for very high frame counts (may cause numerical instability)
+                if num_frames > 64:
+                    print(f"[QwenVL] WARNING: Processing {num_frames} frames - this may cause numerical instability or OOM")
+                    print(f"[QwenVL] Consider reducing frame count to 64 or less for stable inference")
+                
+                print(f"[QwenVL] Qwen3.5: Processing all {num_frames} video frames as images")
+                
+                # Add each frame as an image - no hidden downsampling
+                for frame in frames:
+                    content.append({"type": "image"})
+                    images_list.append(frame)
+        
+        # Add text prompt
+        content.append({"type": "text", "text": prompt_text})
+        
+        # Build conversation
+        conversation = [{"role": "user", "content": content}]
+        
+        # Apply chat template
+        chat = self.processor.apply_chat_template(
+            conversation, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+        
+        # Prepare processor kwargs
+        processor_kwargs = {
+            "text": chat,
+            "return_tensors": "pt",
+        }
+        
+        # Add images if present
+        if images_list:
+            processor_kwargs["images"] = images_list
+        
+        # Process inputs
+        processed = self.processor(**processor_kwargs)
+        
+        print(f"[QwenVL] Qwen3.5 processor output keys: {list(processed.keys())}")
+        
+        # Move to model device
+        model_device = next(self.model.parameters()).device
+        model_inputs = {
+            key: value.to(model_device) if torch.is_tensor(value) else value
+            for key, value in processed.items()
+        }
+        
+        # Setup generation kwargs
+        stop_tokens = [self.tokenizer.eos_token_id]
+        if hasattr(self.tokenizer, "eot_id") and self.tokenizer.eot_id is not None:
+            stop_tokens.append(self.tokenizer.eot_id)
+        
+        kwargs = {
+            "max_new_tokens": max_tokens,
+            "repetition_penalty": repetition_penalty,
+            "num_beams": num_beams,
+            "eos_token_id": stop_tokens,
+            "pad_token_id": self.tokenizer.pad_token_id,
+        }
+        
+        if num_beams == 1:
+            # Ensure temperature is not too low to avoid numerical issues
+            safe_temperature = max(temperature, 0.1)
+            kwargs.update({
+                "do_sample": True, 
+                "temperature": safe_temperature, 
+                "top_p": top_p,
+                "top_k": 50,  # Add top_k for more stable sampling
+            })
+        else:
+            kwargs["do_sample"] = False
+        
+        # Generate with error handling for numerical instability
+        try:
+            outputs = self.model.generate(**model_inputs, **kwargs)
+        except RuntimeError as e:
+            if "probability tensor" in str(e) or "inf" in str(e).lower() or "nan" in str(e).lower():
+                print("[QwenVL] Numerical instability detected, retrying with greedy decoding...")
+                # Fallback to greedy decoding (no sampling)
+                fallback_kwargs = {
+                    "max_new_tokens": max_tokens,
+                    "repetition_penalty": repetition_penalty,
+                    "num_beams": 1,
+                    "do_sample": False,
+                    "eos_token_id": stop_tokens,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                }
+                outputs = self.model.generate(**model_inputs, **fallback_kwargs)
+            else:
+                raise
+        
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        
         input_len = model_inputs["input_ids"].shape[-1]
         text = self.tokenizer.decode(outputs[0, input_len:], skip_special_tokens=True)
         return text.strip()
